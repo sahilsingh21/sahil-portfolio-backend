@@ -13,34 +13,30 @@ async function getGeminiResponse(messages) {
     },
   });
 
-  // Build history (all messages except the last one)
-  const history = messages.slice(0, -1).map(m => ({
+  // Filter out empty messages
+  const allMessages = messages.filter(m => m.content && m.content.trim());
+
+  // Separate history from last message
+  const lastMessage = allMessages.at(-1);
+  let history = allMessages.slice(0, -1);
+
+  // Remove leading assistant messages — Gemini requires history to start with 'user'
+  while (history.length > 0 && history[0].role === 'assistant') {
+    history = history.slice(1);
+  }
+
+  // Convert to Gemini format
+  const geminiHistory = history.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }],
   }));
 
-  const chat = model.startChat({ history });
-  const lastMessage = messages.at(-1)?.content || '';
-  const result = await chat.sendMessage(lastMessage);
+  const chat = model.startChat({ history: geminiHistory });
+  const result = await chat.sendMessage(lastMessage?.content || '');
   return result.response.text();
 }
 
-// POST /api/chat
-router.post('/', async (req, res) => {
-  try {
-    const { messages } = req.body;
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'messages array is required' });
-    }
-
-    const reply = await getGeminiResponse(messages);
-    res.json({ success: true, reply, provider: 'gemini' });
-  } catch (err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ error: 'AI chat temporarily unavailable. Please try again.' });
-  }
-});
-
+// GET /api/chat/models — list available models (for debugging)
 router.get('/models', async (req, res) => {
   try {
     const response = await fetch(
@@ -51,6 +47,36 @@ router.get('/models', async (req, res) => {
     res.json({ models });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/chat
+router.post('/', async (req, res) => {
+  try {
+    console.log('Chat request received:', req.body?.messages?.length, 'messages');
+
+    const { messages } = req.body;
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    const reply = await getGeminiResponse(messages);
+
+    // Track analytics — ignore if MongoDB is down
+    try {
+      const Analytics = require('../models/Analytics');
+      await Analytics.create({
+        event: 'chat_message',
+        meta: { provider: 'gemini', userMsg: messages.at(-1)?.content?.slice(0, 80) },
+      });
+    } catch (dbErr) {
+      console.log('Analytics skip:', dbErr.message);
+    }
+
+    res.json({ success: true, reply, provider: 'gemini' });
+  } catch (err) {
+    console.error('Chat error:', err.message);
+    res.status(500).json({ error: 'AI chat temporarily unavailable. Please try again.' });
   }
 });
 
