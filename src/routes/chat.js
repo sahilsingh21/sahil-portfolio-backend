@@ -75,8 +75,12 @@ router.post('/', async (req, res) => {
 
     res.json({ success: true, reply, provider: 'gemini' });
   } catch (err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ error: 'AI chat temporarily unavailable. Please try again.' });
+    console.error('Chat error FULL:', err);
+    res.status(200).json({ 
+      success: true, 
+      reply: "I encountered an issue processing that. Try rephrasing or ask me about Sahil's experience and projects!",
+      provider: 'gemini'
+    });
   }
 });
 
