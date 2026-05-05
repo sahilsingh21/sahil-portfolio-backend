@@ -1,75 +1,56 @@
 const express = require('express');
 const router = express.Router();
-const Anthropic = require('@anthropic-ai/sdk').default || require('@anthropic-ai/sdk');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { PORTFOLIO_CONTEXT } = require('../config/portfolioContext');
-const Analytics = require('../models/Analytics');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// POST /api/chat — non-streaming response
+async function getGeminiResponse(messages) {
+  const model = gemini.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    systemInstruction: {
+      parts: [{ text: PORTFOLIO_CONTEXT }],
+    },
+  });
+
+  // Build history (all messages except the last one)
+  const history = messages.slice(0, -1).map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }));
+
+  const chat = model.startChat({ history });
+  const lastMessage = messages.at(-1)?.content || '';
+  const result = await chat.sendMessage(lastMessage);
+  return result.response.text();
+}
+
+// POST /api/chat
 router.post('/', async (req, res) => {
   try {
     const { messages } = req.body;
-
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    // Keep last 10 messages for context window efficiency
-    const recentMessages = messages.slice(-10);
-
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 600,
-      system: PORTFOLIO_CONTEXT,
-      messages: recentMessages,
-    });
-
-    const reply = response.content[0]?.text || "I'm not sure about that. Try asking about Sahil's projects or experience!";
-
-    // Track chat usage
-    await Analytics.create({ event: 'chat_message', meta: { userMsg: messages.at(-1)?.content?.slice(0, 80) } });
-
-    res.json({ success: true, reply });
+    const reply = await getGeminiResponse(messages);
+    res.json({ success: true, reply, provider: 'gemini' });
   } catch (err) {
     console.error('Chat error:', err.message);
     res.status(500).json({ error: 'AI chat temporarily unavailable. Please try again.' });
   }
 });
 
-// POST /api/chat/stream — streaming SSE response
-router.post('/stream', async (req, res) => {
+router.get('/models', async (req, res) => {
   try {
-    const { messages } = req.body;
-    if (!messages?.length) return res.status(400).json({ error: 'messages required' });
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
-    const stream = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 600,
-      system: PORTFOLIO_CONTEXT,
-      messages: messages.slice(-10),
-      stream: true,
-    });
-
-    for await (const event of stream) {
-      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-        res.write(`data: ${JSON.stringify({ text: event.delta.text })}\n\n`);
-      }
-      if (event.type === 'message_stop') {
-        res.write('data: [DONE]\n\n');
-        break;
-      }
-    }
-
-    res.end();
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`
+    );
+    const data = await response.json();
+    const models = data.models?.map(m => m.name) || [];
+    res.json({ models });
   } catch (err) {
-    console.error('Stream error:', err.message);
-    res.write(`data: ${JSON.stringify({ error: 'Stream failed' })}\n\n`);
-    res.end();
+    res.status(500).json({ error: err.message });
   }
 });
 
