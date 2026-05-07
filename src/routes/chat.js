@@ -3,40 +3,56 @@ const router = express.Router();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { PORTFOLIO_CONTEXT } = require('../config/portfolioContext');
 
-const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 
 async function getGeminiResponse(messages) {
-  const model = gemini.getGenerativeModel({
-    model: 'gemini-2.5-flash',
-    systemInstruction: {
-      parts: [{ text: PORTFOLIO_CONTEXT }],
-    },
-  });
-
-  // Filter out empty messages
   const allMessages = messages.filter(m => m.content && m.content.trim());
-
-  // Separate history from last message
   const lastMessage = allMessages.at(-1);
   let history = allMessages.slice(0, -1);
 
-  // Remove leading assistant messages — Gemini requires history to start with 'user'
+  // Remove leading assistant messages
   while (history.length > 0 && history[0].role === 'assistant') {
     history = history.slice(1);
   }
 
-  // Convert to Gemini format
-  const geminiHistory = history.map(m => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
+  // Ensure alternating roles
+  const geminiHistory = [];
+  let lastRole = null;
+  for (const m of history) {
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    if (role === lastRole) continue;
+    geminiHistory.push({ role, parts: [{ text: m.content }] });
+    lastRole = role;
+  }
 
-  const chat = model.startChat({ history: geminiHistory });
-  const result = await chat.sendMessage(lastMessage?.content || '');
-  return result.response.text();
+  // Try each model in order
+  for (const modelName of MODELS) {
+    try {
+      console.log(`[Chat] Trying model: ${modelName}`);
+      const model = geminiClient.getGenerativeModel({
+        model: modelName,
+        systemInstruction: {
+          parts: [{ text: PORTFOLIO_CONTEXT }],
+        },
+      });
+
+      const chat = model.startChat({ history: geminiHistory });
+      const result = await chat.sendMessage(lastMessage?.content || '');
+      const text = result.response.text();
+      console.log(`[Chat] Success with model: ${modelName}`);
+      return text;
+    } catch (err) {
+      console.warn(`[Chat] Model ${modelName} failed: ${err.message}`);
+      continue;
+    }
+  }
+
+  throw new Error('All Gemini models unavailable');
 }
 
-// GET /api/chat/models — list available models (for debugging)
+// GET /api/chat/models
 router.get('/models', async (req, res) => {
   try {
     const response = await fetch(
@@ -73,13 +89,13 @@ router.post('/', async (req, res) => {
       console.log('Analytics skip:', dbErr.message);
     }
 
-    res.json({ success: true, reply, provider: 'gemini' });
+    res.status(200).json({ success: true, reply, provider: 'gemini' });
   } catch (err) {
     console.error('Chat error FULL:', err);
-    res.status(200).json({ 
-      success: true, 
-      reply: "I encountered an issue processing that. Try rephrasing or ask me about Sahil's experience and projects!",
-      provider: 'gemini'
+    res.status(200).json({
+      success: true,
+      reply: "I'm experiencing high demand right now. Please try again in a moment!",
+      provider: 'gemini',
     });
   }
 });
