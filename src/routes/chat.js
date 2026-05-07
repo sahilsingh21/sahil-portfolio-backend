@@ -5,97 +5,180 @@ const { PORTFOLIO_CONTEXT } = require('../config/portfolioContext');
 
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'];
+const MODELS = [
+  'gemini-2.0-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function tryModel(modelName, geminiHistory, prompt) {
+  const model = geminiClient.getGenerativeModel({
+    model: modelName,
+    systemInstruction: PORTFOLIO_CONTEXT,
+  });
+
+  const chat = model.startChat({
+    history: geminiHistory,
+  });
+
+  return await chat.sendMessage(prompt);
+}
 
 async function getGeminiResponse(messages) {
-  const allMessages = messages.filter(m => m.content && m.content.trim());
-  const lastMessage = allMessages.at(-1);
-  let history = allMessages.slice(0, -1);
+  const validMessages = messages.filter(
+    (m) => m?.content && m.content.trim()
+  );
 
-  // Remove leading assistant messages
-  while (history.length > 0 && history[0].role === 'assistant') {
-    history = history.slice(1);
+  const lastMessage = validMessages.at(-1);
+
+  if (!lastMessage) {
+    throw new Error('No valid user message');
   }
 
-  // Ensure alternating roles
+  let history = validMessages.slice(0, -1);
+
+  // Remove invalid leading assistant/model messages
+  while (
+    history.length > 0 &&
+    ['assistant', 'model'].includes(history[0].role)
+  ) {
+    history.shift();
+  }
+
+  // Gemini requires alternating roles
   const geminiHistory = [];
-  let lastRole = null;
-  for (const m of history) {
-    const role = m.role === 'assistant' ? 'model' : 'user';
-    if (role === lastRole) continue;
-    geminiHistory.push({ role, parts: [{ text: m.content }] });
-    lastRole = role;
+
+  let previousRole = null;
+
+  for (const msg of history) {
+    const role = msg.role === 'assistant' ? 'model' : 'user';
+
+    if (role === previousRole) continue;
+
+    geminiHistory.push({
+      role,
+      parts: [{ text: msg.content }],
+    });
+
+    previousRole = role;
   }
 
-  // Try each model in order
+  let lastError = null;
+
   for (const modelName of MODELS) {
     try {
-      console.log(`[Chat] Trying model: ${modelName}`);
-      const model = geminiClient.getGenerativeModel({
-        model: modelName,
-        systemInstruction: {
-          parts: [{ text: PORTFOLIO_CONTEXT }],
-        },
-      });
+      console.log(`Trying Gemini model: ${modelName}`);
 
-      const chat = model.startChat({ history: geminiHistory });
-      const result = await chat.sendMessage(lastMessage?.content || '');
+      const result = await tryModel(
+        modelName,
+        geminiHistory,
+        lastMessage.content
+      );
+
       const text = result.response.text();
-      console.log(`[Chat] Success with model: ${modelName}`);
+
+      if (!text) {
+        throw new Error('Empty response');
+      }
+
+      console.log(`Success: ${modelName}`);
+
       return text;
     } catch (err) {
-      console.warn(`[Chat] Model ${modelName} failed: ${err.message}`);
+      lastError = err;
+
+      console.warn(`Model failed: ${modelName}`);
+      console.warn(err.message);
+
+      // Rate limit handling
+      if (
+        err.message.includes('429') ||
+        err.message.includes('quota')
+      ) {
+        console.log('Rate limited. Waiting 2 seconds...');
+        await sleep(2000);
+      }
+
       continue;
     }
   }
 
-  throw new Error('All Gemini models unavailable');
+  throw lastError || new Error('All Gemini models failed');
 }
 
-// GET /api/chat/models
+// GET available models
 router.get('/models', async (req, res) => {
   try {
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`
     );
+
     const data = await response.json();
-    const models = data.models?.map(m => m.name) || [];
-    res.json({ models });
+
+    const models =
+      data.models?.map((m) => ({
+        name: m.name,
+        displayName: m.displayName,
+      })) || [];
+
+    res.json({
+      success: true,
+      models,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
-// POST /api/chat
+// Main chat route
 router.post('/', async (req, res) => {
   try {
-    console.log('Chat request received:', req.body?.messages?.length, 'messages');
-
     const { messages } = req.body;
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'messages array is required' });
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'messages array required',
+      });
     }
+
+    console.log(`Incoming chat (${messages.length} msgs)`);
 
     const reply = await getGeminiResponse(messages);
 
-    // Track analytics — ignore if MongoDB is down
+    // Optional analytics
     try {
       const Analytics = require('../models/Analytics');
+
       await Analytics.create({
         event: 'chat_message',
-        meta: { provider: 'gemini', userMsg: messages.at(-1)?.content?.slice(0, 80) },
+        meta: {
+          provider: 'gemini',
+          preview: messages.at(-1)?.content?.slice(0, 100),
+        },
       });
-    } catch (dbErr) {
-      console.log('Analytics skip:', dbErr.message);
+    } catch (analyticsErr) {
+      console.log('Analytics skipped');
     }
 
-    res.status(200).json({ success: true, reply, provider: 'gemini' });
-  } catch (err) {
-    console.error('Chat error FULL:', err);
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      reply: "I'm experiencing high demand right now. Please try again in a moment!",
       provider: 'gemini',
+      reply,
+    });
+  } catch (err) {
+    console.error('FULL CHAT ERROR:', err);
+
+    return res.status(200).json({
+      success: true,
+      provider: 'fallback',
+      reply:
+        'Server is busy right now. Please try again in a few moments.',
     });
   }
 });

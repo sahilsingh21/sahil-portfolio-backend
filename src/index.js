@@ -20,23 +20,29 @@ connectDB();
 // Security middleware
 app.use(helmet());
 
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://sahilsingh.co.in',
+  'https://www.sahilsingh.co.in',
+];
+
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
+    // Allow requests with no origin (mobile apps, curl, server-to-server)
     if (!origin) return callback(null, true);
-    
-    // Allow all vercel.app domains and localhost
+
     if (
+      allowedOrigins.includes(origin) ||
       origin.includes('vercel.app') ||
       origin.includes('localhost') ||
       origin.includes('onrender.com')
     ) {
       return callback(null, true);
     }
-    
+
     callback(new Error('Not allowed by CORS'));
   },
-  credentials: true,
+  credentials: true, 
 }));
 
 // Rate limiting
