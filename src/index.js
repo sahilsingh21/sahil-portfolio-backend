@@ -14,6 +14,9 @@ const analyticsRoutes = require('./routes/analytics');
 
 const app = express();
 
+// ✅ Required for Render/Heroku — trust the proxy
+app.set('trust proxy', 1);
+
 // Connect to MongoDB
 connectDB();
 
