@@ -5,13 +5,44 @@ const { PORTFOLIO_CONTEXT } = require('../config/portfolioContext');
 
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const OLLAMA_URL = process.env.OLLAMA_URL || 'https://ai.sahilsingh.co.in';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL;
 
 const GEMINI_MODELS = [
   'gemini-2.0-flash-lite',
   'gemini-2.5-flash',
   'gemini-flash-latest',
 ];
+
+async function getOllamaModels() {
+  const urls = [`${OLLAMA_URL}/api/tags`, `${OLLAMA_URL}/api/models`];
+  let data;
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) continue;
+      data = await response.json();
+      break;
+    } catch (err) {
+      continue;
+    }
+  }
+
+  const models = data?.models?.map(m => m.name) || data?.tags?.map(t => t.name) || [];
+  if (!models.length) {
+    throw new Error('Could not discover any Ollama models from configured URL');
+  }
+
+  return models;
+}
+
+function resolveOllamaModel(models) {
+  if (OLLAMA_MODEL && models.includes(OLLAMA_MODEL)) {
+    return OLLAMA_MODEL;
+  }
+
+  return models.find(name => name.startsWith('llama3')) || models[0];
+}
 
 // ── Ollama ────────────────────────────────────────────────────────────────────
 function normalizeOllamaReply(data) {
@@ -50,8 +81,10 @@ async function getOllamaResponse(messages) {
     })),
   ];
 
+  const models = await getOllamaModels();
+  const model = resolveOllamaModel(models);
   const payload = {
-    model: OLLAMA_MODEL,
+    model,
     messages: ollamaMessages,
     stream: false,
   };
@@ -65,7 +98,7 @@ async function getOllamaResponse(messages) {
   let lastError;
   for (const url of endpoints) {
     try {
-      console.log(`[Ollama] Trying: ${url}`);
+      console.log(`[Ollama] Trying: ${url} with model=${model}`);
       const data = await callOllama(url, payload);
       const reply = normalizeOllamaReply(data);
       if (!reply) {
@@ -171,7 +204,11 @@ router.get('/models', async (req, res) => {
       || data.tags?.map(t => t.name)
       || [];
 
-    res.json({ ollama: models, url: OLLAMA_URL, urlUsed });
+    const selectedModel = OLLAMA_MODEL && models.includes(OLLAMA_MODEL)
+      ? OLLAMA_MODEL
+      : models.find(name => name.startsWith('llama3')) || models[0];
+
+    res.json({ ollama: models, url: OLLAMA_URL, urlUsed, selectedModel });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
