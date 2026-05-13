@@ -14,6 +14,33 @@ const GEMINI_MODELS = [
 ];
 
 // ── Ollama ────────────────────────────────────────────────────────────────────
+function normalizeOllamaReply(data) {
+  return (
+    data?.choices?.[0]?.message?.content ||
+    data?.message?.content ||
+    (typeof data?.output === 'string' && data.output) ||
+    (typeof data?.response === 'string' && data.response) ||
+    data?.choices?.[0]?.text ||
+    ''
+  );
+}
+
+async function callOllama(url, payload) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000), // 30 second timeout
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Ollama error ${response.status} ${response.statusText}: ${body}`);
+  }
+
+  return response.json();
+}
+
 async function getOllamaResponse(messages) {
   const ollamaMessages = [
     { role: 'system', content: PORTFOLIO_CONTEXT },
@@ -23,24 +50,35 @@ async function getOllamaResponse(messages) {
     })),
   ];
 
-  const response = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      messages: ollamaMessages,
-      stream: false,
-    }),
-    signal: AbortSignal.timeout(30000), // 30 second timeout
-  });
+  const payload = {
+    model: OLLAMA_MODEL,
+    messages: ollamaMessages,
+    stream: false,
+  };
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Ollama error ${response.status}: ${err}`);
+  const endpoints = [
+    `${OLLAMA_URL}/api/chat`,
+    `${OLLAMA_URL}/api/v1/chat`,
+    `${OLLAMA_URL}/chat`,
+  ];
+
+  let lastError;
+  for (const url of endpoints) {
+    try {
+      console.log(`[Ollama] Trying: ${url}`);
+      const data = await callOllama(url, payload);
+      const reply = normalizeOllamaReply(data);
+      if (!reply) {
+        throw new Error(`Unable to parse Ollama response: ${JSON.stringify(data).slice(0, 1000)}`);
+      }
+      return reply;
+    } catch (err) {
+      console.warn(`[Ollama] ${url} failed: ${err.message}`);
+      lastError = err;
+    }
   }
 
-  const data = await response.json();
-  return data.message?.content || '';
+  throw lastError || new Error('All Ollama endpoints failed');
 }
 
 // ── Gemini fallback ───────────────────────────────────────────────────────────
@@ -113,9 +151,27 @@ async function getAIResponse(messages) {
 // GET /api/chat/models
 router.get('/models', async (req, res) => {
   try {
-    const response = await fetch(`${OLLAMA_URL}/api/tags`);
-    const data = await response.json();
-    res.json({ ollama: data.models?.map(m => m.name), url: OLLAMA_URL });
+    const urls = [`${OLLAMA_URL}/api/tags`, `${OLLAMA_URL}/api/models`];
+    let data;
+    let urlUsed;
+
+    for (const url of urls) {
+      const response = await fetch(url);
+      if (!response.ok) continue;
+      data = await response.json();
+      urlUsed = url;
+      break;
+    }
+
+    if (!data) {
+      throw new Error('Unable to fetch Ollama models from configured URL');
+    }
+
+    const models = data.models?.map(m => m.name)
+      || data.tags?.map(t => t.name)
+      || [];
+
+    res.json({ ollama: models, url: OLLAMA_URL, urlUsed });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
