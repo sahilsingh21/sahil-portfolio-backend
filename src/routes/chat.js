@@ -4,181 +4,153 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { PORTFOLIO_CONTEXT } = require('../config/portfolioContext');
 
 const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const OLLAMA_URL = process.env.OLLAMA_URL || 'https://ai.sahilsingh.co.in';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3';
 
-const MODELS = [
+const GEMINI_MODELS = [
   'gemini-2.0-flash-lite',
   'gemini-2.5-flash',
   'gemini-flash-latest',
 ];
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ── Ollama ────────────────────────────────────────────────────────────────────
+async function getOllamaResponse(messages) {
+  const ollamaMessages = [
+    { role: 'system', content: PORTFOLIO_CONTEXT },
+    ...messages.map(m => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: m.content,
+    })),
+  ];
 
-async function tryModel(modelName, geminiHistory, prompt) {
-  const model = geminiClient.getGenerativeModel({
-    model: modelName,
-    systemInstruction: PORTFOLIO_CONTEXT,
+  const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: OLLAMA_MODEL,
+      messages: ollamaMessages,
+      stream: false,
+    }),
+    signal: AbortSignal.timeout(30000), // 30 second timeout
   });
 
-  const chat = model.startChat({
-    history: geminiHistory,
-  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Ollama error ${response.status}: ${err}`);
+  }
 
-  return await chat.sendMessage(prompt);
+  const data = await response.json();
+  return data.message?.content || '';
 }
 
+// ── Gemini fallback ───────────────────────────────────────────────────────────
 async function getGeminiResponse(messages) {
-  const validMessages = messages.filter(
-    (m) => m?.content && m.content.trim()
-  );
+  const allMessages = messages.filter(m => m.content && m.content.trim());
+  const lastMessage = allMessages.at(-1);
+  let history = allMessages.slice(0, -1);
 
-  const lastMessage = validMessages.at(-1);
-
-  if (!lastMessage) {
-    throw new Error('No valid user message');
+  while (history.length > 0 && history[0].role === 'assistant') {
+    history = history.slice(1);
   }
 
-  let history = validMessages.slice(0, -1);
-
-  // Remove invalid leading assistant/model messages
-  while (
-    history.length > 0 &&
-    ['assistant', 'model'].includes(history[0].role)
-  ) {
-    history.shift();
-  }
-
-  // Gemini requires alternating roles
   const geminiHistory = [];
-
-  let previousRole = null;
-
-  for (const msg of history) {
-    const role = msg.role === 'assistant' ? 'model' : 'user';
-
-    if (role === previousRole) continue;
-
-    geminiHistory.push({
-      role,
-      parts: [{ text: msg.content }],
-    });
-
-    previousRole = role;
+  let lastRole = null;
+  for (const m of history) {
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    if (role === lastRole) continue;
+    geminiHistory.push({ role, parts: [{ text: m.content }] });
+    lastRole = role;
   }
 
-  let lastError = null;
-
-  for (const modelName of MODELS) {
+  for (const modelName of GEMINI_MODELS) {
     try {
-      console.log(`Trying Gemini model: ${modelName}`);
-
-      const result = await tryModel(
-        modelName,
-        geminiHistory,
-        lastMessage.content
-      );
-
-      const text = result.response.text();
-
-      if (!text) {
-        throw new Error('Empty response');
-      }
-
-      console.log(`Success: ${modelName}`);
-
-      return text;
+      console.log(`[Gemini] Trying: ${modelName}`);
+      const model = geminiClient.getGenerativeModel({
+        model: modelName,
+        systemInstruction: { parts: [{ text: PORTFOLIO_CONTEXT }] },
+      });
+      const chat = model.startChat({ history: geminiHistory });
+      const result = await chat.sendMessage(lastMessage?.content || '');
+      return result.response.text();
     } catch (err) {
-      lastError = err;
-
-      console.warn(`Model failed: ${modelName}`);
-      console.warn(err.message);
-
-      // Rate limit handling
-      if (
-        err.message.includes('429') ||
-        err.message.includes('quota')
-      ) {
-        console.log('Rate limited. Waiting 2 seconds...');
-        await sleep(2000);
-      }
-
+      console.warn(`[Gemini] ${modelName} failed: ${err.message}`);
       continue;
     }
   }
 
-  throw lastError || new Error('All Gemini models failed');
+  throw new Error('All Gemini models unavailable');
 }
 
-// GET available models
+// ── Main handler ──────────────────────────────────────────────────────────────
+async function getAIResponse(messages) {
+  // Try Ollama first — no quota, no cost
+  try {
+    console.log('[Chat] Trying Ollama...');
+    const reply = await getOllamaResponse(messages);
+    console.log('[Chat] Ollama success');
+    return { reply, provider: 'ollama' };
+  } catch (err) {
+    console.warn('[Chat] Ollama failed:', err.message);
+  }
+
+  // Fallback to Gemini
+  try {
+    console.log('[Chat] Trying Gemini...');
+    const reply = await getGeminiResponse(messages);
+    console.log('[Chat] Gemini success');
+    return { reply, provider: 'gemini' };
+  } catch (err) {
+    console.warn('[Chat] Gemini failed:', err.message);
+  }
+
+  // Both failed
+  return {
+    reply: "I'm experiencing high demand right now. Please try again in a moment!",
+    provider: 'none',
+  };
+}
+
+// GET /api/chat/models
 router.get('/models', async (req, res) => {
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`
-    );
-
+    const response = await fetch(`${OLLAMA_URL}/api/tags`);
     const data = await response.json();
-
-    const models =
-      data.models?.map((m) => ({
-        name: m.name,
-        displayName: m.displayName,
-      })) || [];
-
-    res.json({
-      success: true,
-      models,
-    });
+    res.json({ ollama: data.models?.map(m => m.name), url: OLLAMA_URL });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Main chat route
+// POST /api/chat
 router.post('/', async (req, res) => {
   try {
+    console.log('Chat request:', req.body?.messages?.length, 'messages');
     const { messages } = req.body;
 
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'messages array required',
-      });
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required' });
     }
 
-    console.log(`Incoming chat (${messages.length} msgs)`);
+    const { reply, provider } = await getAIResponse(messages);
 
-    const reply = await getGeminiResponse(messages);
-
-    // Optional analytics
+    // Track analytics
     try {
       const Analytics = require('../models/Analytics');
-
       await Analytics.create({
         event: 'chat_message',
-        meta: {
-          provider: 'gemini',
-          preview: messages.at(-1)?.content?.slice(0, 100),
-        },
+        meta: { provider, userMsg: messages.at(-1)?.content?.slice(0, 80) },
       });
-    } catch (analyticsErr) {
-      console.log('Analytics skipped');
+    } catch (dbErr) {
+      console.log('Analytics skip:', dbErr.message);
     }
 
-    return res.status(200).json({
-      success: true,
-      provider: 'gemini',
-      reply,
-    });
+    res.status(200).json({ success: true, reply, provider });
   } catch (err) {
-    console.error('FULL CHAT ERROR:', err);
-
-    return res.status(200).json({
+    console.error('Chat error:', err.message);
+    res.status(200).json({
       success: true,
-      provider: 'fallback',
-      reply:
-        'Server is busy right now. Please try again in a few moments.',
+      reply: "I'm experiencing high demand. Please try again in a moment!",
+      provider: 'none',
     });
   }
 });
